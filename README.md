@@ -28,6 +28,11 @@ Upstream's own policy, from `plugins/AGENTS.md`:
 |---|---|---|---|
 | [`yeoman-a2a/`](yeoman-a2a/) | `yeoman` | Hermes side of the strict Hermes/Yeoman A2A profile (`urn:hermes-yeoman:a2a-profile:v1`) | Not proposed — bilateral integration |
 
+Two host-local patches with no upstream home are kept in [`patches/`](patches/) — one for the
+third-party `tradingagents` plugin, one for the bundled Langfuse plugin. They are not plugins and
+are not installable; they exist so a `git pull` or `hermes plugins update` cannot silently drop
+them.
+
 ## Install
 
 `hermes plugins install` understands a subdirectory, so one repo can hold many addenda:
