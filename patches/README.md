@@ -10,7 +10,6 @@ re-apply it.
 | Patch | Applies to | Base revision |
 |---|---|---|
 | [`tradingagents-settings-from-config.patch`](tradingagents-settings-from-config.patch) | `~/.hermes/plugins/tradingagents` (third-party plugin) | `130ba17d75207a990f55cc956ef2b3b643709167` |
-| [`langfuse-plugin-env-settings.patch`](langfuse-plugin-env-settings.patch) | `plugins/observability/langfuse/` in the `hermes-agent` checkout (bundled plugin) | upstream `422bc9bde9` at time of writing |
 
 ## Trading agents — read settings from `config.yaml`
 
@@ -35,25 +34,20 @@ Re-apply after `hermes plugins update tradingagents` — that command re-syncs t
 `config.yaml`" is a generic improvement to that plugin. A fork + PR against
 `cfournel/hermes-tradingagents-plugin` would retire this entry.
 
-## Langfuse — take `base_url` / `environment` / `release` from the environment
+## Retired: Langfuse environment tagging
 
-The bundled Langfuse plugin resolves those three through `_secret(...)`, so
-`LANGFUSE_BASE_URL` and `HERMES_LANGFUSE_ENV` never take effect. The patch switches those three
-lookups to `_env(...)`, leaving `PUBLIC_KEY` / `SECRET_KEY` on the secret path.
+A patch here used to switch the bundled Langfuse plugin's `environment` / `release` /
+`base_url` lookups from `_secret(...)` (profile secret scope) to `_env(...)`. It was
+**unnecessary**: the plugin only passes `environment=` to the SDK when the value is
+non-empty, and `langfuse._client.client` falls back to
+`os.environ["LANGFUSE_TRACING_ENVIRONMENT"]` (and `LANGFUSE_RELEASE`) on its own.
 
-Without it, `base_url` falls back to `https://cloud.langfuse.com` and traces lose their
-`environment` / `release` tags.
+Set those SDK-native variables in `.env` instead:
 
-```bash
-cd ~/.hermes/hermes-agent
-git apply /path/to/langfuse-plugin-env-settings.patch
-git status --short          # expect: M plugins/observability/langfuse/__init__.py
+```
+LANGFUSE_TRACING_ENVIRONMENT=heimdall
+HERMES_LANGFUSE_ENV=heimdall     # legacy; ignored on this path, kept for reference
 ```
 
-This one patches a **bundled** file, so it is also the only thing keeping the `hermes-agent`
-checkout dirty. Upstream may fix it eventually; check before re-applying:
-
-```bash
-grep -n 'LANGFUSE_{name}' plugins/observability/langfuse/__init__.py
-# still `_secret(...)` -> patch still needed
-```
+Dropping the patch left the `hermes-agent` checkout with **zero** local modifications, so
+upgrades stay fast-forwards.
