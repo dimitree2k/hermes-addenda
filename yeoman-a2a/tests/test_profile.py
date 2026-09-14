@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,6 +15,8 @@ from yeoman_a2a.transport import YeomanA2AAdapter as A2AAdapter
 
 @pytest.fixture(autouse=True)
 def _contract_path(monkeypatch):
+    if os.environ.get("A2A_CONTRACTS_PATH"):
+        return
     local_checkout = Path.home() / ".hermes" / "a2a-contracts"
     if local_checkout.is_dir():
         monkeypatch.setenv("A2A_CONTRACTS_PATH", str(local_checkout))
@@ -96,6 +99,8 @@ def test_contract_rejects_unknown_fields_and_raw_jids():
 def test_contract_result_is_validated_by_skill():
     result = contract.result_for_reply("research.deep", "A report")
     assert result["output"] == {"report": "A report", "sources": []}
+    trading = contract.result_for_reply("trading.analyze", "A trading report")
+    assert trading["output"] == {"report": "A trading report", "sources": []}
     with pytest.raises(contract.ContractViolation):
         contract.validate_result({
             "skill": "research.deep",
@@ -267,6 +272,20 @@ def test_card_web_profile_skills_respect_advertised_toolset_policy(monkeypatch):
     monkeypatch.setattr(registry, "get_definitions", lambda _names, quiet=True: {"web_search": object()})
     monkeypatch.setattr(registry, "get_tool_names_for_toolset", lambda _name: [])
     assert not {"search.web", "research.deep"} & {skill["id"] for skill in adapter._build_card()["skills"]}
+
+
+def test_card_advertises_trading_only_for_the_native_tool(monkeypatch):
+    from tools.registry import registry
+    adapter = A2AAdapter(PlatformConfig(enabled=True))
+    monkeypatch.setattr(registry, "get_definitions", lambda names, quiet=True: (
+        [{"function": {"name": "tradingagents_analyze"}}]
+        if "tradingagents_analyze" in names else []
+    ))
+    card = adapter._build_card()
+    assert "trading.analyze" in {skill["id"] for skill in card["skills"]}
+
+    monkeypatch.setattr(registry, "get_definitions", lambda _names, quiet=True: [])
+    assert "trading.analyze" not in {skill["id"] for skill in adapter._build_card()["skills"]}
 
 
 def test_profile_rpc_endpoint_stays_on_configured_origin():
@@ -619,6 +638,87 @@ def test_research_idempotency_reuses_task_and_rejects_conflict(monkeypatch):
     assert len(dispatched) == 1
     assert conflict["status"]["state"] == protocol.STATE_REJECTED
     assert conflict["artifacts"][0]["parts"][0]["data"]["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+
+
+def test_trading_analyze_dispatches_native_worker_without_llm_session(monkeypatch):
+    from tools.registry import registry
+
+    adapter = A2AAdapter(PlatformConfig(enabled=True))
+    adapter._tradingagents_is_available = lambda _agent=None: True  # type: ignore[method-assign]
+    adapter.handle_message = lambda _event: (_ for _ in ()).throw(AssertionError("LLM session used"))  # type: ignore[method-assign]
+    background = []
+    monkeypatch.setattr(a2a_adapter, "_daemon_thread", lambda target, _name: background.append(target))
+    calls = []
+
+    def dispatch(name, args):
+        calls.append((name, args))
+        return '{"date":"2026-09-14","results":[]}'
+
+    monkeypatch.setattr(registry, "dispatch", dispatch)
+    invocation = {
+        "skill": "trading.analyze",
+        "input": {"question": "Analyse AAPL.", "idempotency_key": "trading-001"},
+    }
+    task, pending = adapter._prepare_task(
+        {"message": protocol.structured_message(protocol.ROLE_USER, invocation, context_id="ctx-trading")},
+        "yeoman",
+    )
+
+    assert pending is None
+    assert task["status"]["state"] == protocol.STATE_WORKING
+    assert len(background) == 2
+    background[0]()
+    background[1]()
+    record = adapter.tasks.get(task["id"])
+    assert calls == [("tradingagents_analyze", {"tickers": ["AAPL"]})]
+    assert record["state"] == protocol.STATE_COMPLETED
+    assert record["result_data"]["skill"] == "trading.analyze"
+
+
+def test_research_text_does_not_activate_native_trading_tool(monkeypatch):
+    from tools.registry import registry
+
+    adapter = A2AAdapter(PlatformConfig(enabled=True))
+    adapter._web_search_is_available = lambda _agent=None: True  # type: ignore[method-assign]
+    adapter._loop = object()
+    adapter._message_handler = object()
+    adapter._background_finalize = lambda _pending: None  # type: ignore[method-assign]
+    dispatched = []
+    adapter.handle_message = lambda event: dispatched.append(event)  # type: ignore[method-assign]
+    monkeypatch.setattr("yeoman_a2a.transport.asyncio.run_coroutine_threadsafe", lambda coro, _loop: coro)
+    monkeypatch.setattr(registry, "dispatch", lambda *_args: (_ for _ in ()).throw(AssertionError("native tool used")))
+    invocation = {
+        "skill": "research.deep",
+        "input": {"question": "Explain the tradingagents_analyze tool.", "idempotency_key": "research-002"},
+    }
+
+    task, pending = adapter._prepare_task(
+        {"message": protocol.structured_message(protocol.ROLE_USER, invocation, context_id="ctx-research-native")},
+        "yeoman",
+    )
+    assert pending is None
+    assert task["status"]["state"] == protocol.STATE_WORKING
+    assert len(dispatched) == 1
+
+
+def test_trading_analyze_rejects_routed_worker_without_forwarding(monkeypatch):
+    adapter = A2AAdapter(PlatformConfig(enabled=True))
+    adapter._tradingagents_is_available = lambda _agent=None: True  # type: ignore[method-assign]
+    adapter._forward_to_profile = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("forwarded"))  # type: ignore[method-assign]
+    invocation = {
+        "skill": "trading.analyze",
+        "input": {"question": "Analyse AAPL.", "idempotency_key": "trading-routed"},
+    }
+    agent = {"local": False, "slug": "remote", "tenant": "", "advertised_toolsets": ["tradingagents"]}
+
+    task, pending = adapter._prepare_task(
+        {"message": protocol.structured_message(protocol.ROLE_USER, invocation, context_id="ctx-routed")},
+        "yeoman",
+        agent=agent,
+    )
+    assert pending is None
+    assert task["status"]["state"] == protocol.STATE_REJECTED
+    assert task["artifacts"][0]["parts"][0]["data"]["error"]["code"] == "SKILL_NOT_AVAILABLE"
 
 
 def test_a2a_skill_call_uses_strict_profile_client(monkeypatch):

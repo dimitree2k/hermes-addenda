@@ -1,7 +1,7 @@
 name: yeoman-a2a-platform
 label: Yeoman A2A
 kind: platform
-version: 1.0.0
+version: 1.1.0
 description: >
   Hermes side of the strict Hermes/Yeoman A2A profile
   (urn:hermes-yeoman:a2a-profile:v1). Registers the "yeoman" platform: an inbound
@@ -11,7 +11,7 @@ description: >
 
   This is a bilateral contract between two specific agents, not a general A2A
   feature: the profile URI, the pinned contract package, and the skill set
-  (search.web, research.deep inbound; whatsapp.send, media.voice.generate outbound)
+  (search.web, research.deep, trading.analyze inbound; whatsapp.send, media.voice.generate outbound)
   are fixed. The generic A2A transport lives in transport.py and never mentions the
   peer; profile.py is the entire Yeoman binding.
 

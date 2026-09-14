@@ -276,7 +276,7 @@ def _send_profile_invocation(agent_label: str, peer: dict, skill: str, input_dat
     if state not in known_states:
         raise ValueError(f"Peer '{agent_label}' returned an unknown task state")
     if state not in protocol.TERMINAL_STATES:
-        if state != protocol.STATE_WORKING or skill != "research.deep":
+        if state != protocol.STATE_WORKING or skill not in {"research.deep", "trading.analyze"}:
             raise ValueError(f"Peer '{agent_label}' returned an unsupported non-terminal profile task")
         result = {"skill": skill, "status": "in_progress",
                   "correlation": {"task_id": task["id"], "context_id": context_id}}

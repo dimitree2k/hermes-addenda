@@ -36,6 +36,13 @@ _DEFAULT_PORT = 9900
 _ORPHAN_TIMEOUT, _WATCHDOG_INTERVAL = 300, 60  # seconds: pending task considered orphaned / watchdog period
 _MAX_BODY = 1_048_576  # 1MB max request body — prevents DoS via memory exhaustion
 _SSE_KEEPALIVE = 5  # seconds between SSE keepalive comments
+_TRADING_TOOL = "tradingagents_analyze"
+_TRADING_TICKER_RE = re.compile(r"(?<![A-Za-z0-9])([A-Z][A-Z0-9-]{1,9}(?:\.[A-Z0-9-]+)?)(?![A-Za-z0-9])")
+_TRADING_STOP_WORDS = frozenset({
+    "ANALYSE", "ANALYZE", "APPLE", "AKTIE", "STOCK", "STOCKS", "TRADING", "AGENTS",
+    "THE", "AND", "FOR", "WITH", "FROM", "THIS", "THAT", "TODAY", "CURRENT", "REPORT",
+    "USE", "BUY", "HOLD", "SELL", "RISKS", "RISK", "A2A", "LLM",
+})
 #: Reply sentinels used to classify a failed dispatch. A deadline expiry is retryable
 #: and is reported as DEADLINE_EXCEEDED so a peer can tell it apart from a real failure.
 REPLY_TIMEOUT_MARKER = "[agent did not reply in time]"
@@ -439,8 +446,12 @@ class YeomanA2AAdapter(BasePlatformAdapter):
         agent = agent or self._agents[""]
         generic_skills = self._advertised_skills(agent)
         profile_skills = profile.advertised_skills()
-        if not self._web_search_is_available(agent):
-            profile_skills = [skill for skill in profile_skills if skill["id"] == "conversation"]
+        available_profile_skills = {"conversation"}
+        if self._web_search_is_available(agent):
+            available_profile_skills.update({"search.web", "research.deep"})
+        if self._tradingagents_is_available(agent):
+            available_profile_skills.add("trading.analyze")
+        profile_skills = [skill for skill in profile_skills if skill["id"] in available_profile_skills]
         skills = list({skill["id"]: skill for skill in generic_skills + profile_skills}.values())
         return protocol.build_agent_card(
             name=agent.get("name") or self.agent_name, url=_join_url(self._base_url(public_url), agent.get("path", "")),
@@ -466,6 +477,58 @@ class YeomanA2AAdapter(BasePlatformAdapter):
             return any("web_search" in tool_registry.get_tool_names_for_toolset(name) for name in allowed)
         except Exception:
             return False
+
+    def _tradingagents_is_available(self, agent: Optional[dict] = None) -> bool:
+        """Only advertise trading.analyze when the native TradingAgents tool is live."""
+        try:
+            from tools.registry import registry as tool_registry
+            definitions = tool_registry.get_definitions({_TRADING_TOOL}, quiet=True)
+            if isinstance(definitions, dict):
+                native_tool_live = _TRADING_TOOL in definitions
+            else:
+                native_tool_live = any(
+                    isinstance(definition, dict)
+                    and isinstance(definition.get("function"), dict)
+                    and definition["function"].get("name") == _TRADING_TOOL
+                    for definition in definitions
+                )
+            if not native_tool_live:
+                return False
+            configured = (agent or {}).get("advertised_toolsets") if agent else self._advertised_toolsets
+            if not configured:
+                return True
+            allowed = {str(name) for name in configured}
+            if allowed.intersection({"tradingagents", "trading"}):
+                return True
+            return any(_TRADING_TOOL in tool_registry.get_tool_names_for_toolset(name) for name in allowed)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _trading_tool_args(question: str) -> dict:
+        """Pass explicit symbols when present; otherwise let the native tool use its watchlist."""
+        candidates = _TRADING_TICKER_RE.findall(str(question or ""))
+        tickers = list(dict.fromkeys(
+            ticker for ticker in candidates if ticker not in _TRADING_STOP_WORDS
+        ))
+        return {"tickers": tickers} if tickers else {}
+
+    def _run_tradingagents(self, pending: dict) -> None:
+        """Run the registered native worker and resolve the existing task future."""
+        try:
+            from tools.registry import registry as tool_registry
+            result = tool_registry.dispatch(
+                _TRADING_TOOL,
+                self._trading_tool_args(pending["invocation"]["input"]["question"]),
+            )
+            payload = result if isinstance(result, dict) else json.loads(result)
+            if not isinstance(payload, dict) or payload.get("error"):
+                raise ValueError("native TradingAgents tool returned an error")
+            reply = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+            self._resolve_task(pending["task_id"], protocol.STATE_COMPLETED, reply)
+        except Exception as exc:
+            logger.warning("A2A: TradingAgents task %s failed (%s)", pending["task_id"], type(exc).__name__)
+            self._resolve_task(pending["task_id"], protocol.STATE_FAILED, "[trading worker failed]")
 
     def _advertised_skills(self, agent: Optional[dict] = None) -> list[dict]:
         """Agent Card skills from the live tool registry, restricted by ``advertised_toolsets``;
@@ -570,7 +633,7 @@ class YeomanA2AAdapter(BasePlatformAdapter):
         task_id = protocol.new_task_id()
         skill = str(invocation["skill"])
         scope = self._scope_for_agent(agent)
-        if skill == "research.deep":
+        if skill in {"research.deep", "trading.analyze"}:
             idempotency_key = str(invocation["input"]["idempotency_key"])
             canonical = json.dumps(invocation, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
             index_key = (peer, scope[0], scope[1], skill, idempotency_key)
@@ -606,12 +669,17 @@ class YeomanA2AAdapter(BasePlatformAdapter):
                                   f"{max_turns} turns. Start a new context or increase A2A_MAX_PINGPONG_TURNS.",
                                   result_data=self._profile_error(skill, "ANTI_LOOP", "Task rejected by anti-loop protection.", rec,
                                                                   protocol.STATE_REJECTED) if skill else None)
-        if skill not in {"conversation", "search.web", "research.deep"}:
+        if skill not in {"conversation", "search.web", "research.deep", "trading.analyze"}:
             message = "Requested profile skill is unavailable."
             return self._end_task(rec, protocol.STATE_REJECTED, message,
                                   result_data=self._profile_error(skill, "SKILL_NOT_AVAILABLE", message, rec,
                                                                   protocol.STATE_REJECTED))
         if skill in {"search.web", "research.deep"} and not self._web_search_is_available(agent):
+            message = "Requested profile skill is unavailable."
+            return self._end_task(rec, protocol.STATE_REJECTED, message,
+                                  result_data=self._profile_error(skill, "SKILL_NOT_AVAILABLE", message, rec,
+                                                                  protocol.STATE_REJECTED))
+        if skill == "trading.analyze" and not self._tradingagents_is_available(agent):
             message = "Requested profile skill is unavailable."
             return self._end_task(rec, protocol.STATE_REJECTED, message,
                                   result_data=self._profile_error(skill, "SKILL_NOT_AVAILABLE", message, rec,
@@ -632,7 +700,7 @@ class YeomanA2AAdapter(BasePlatformAdapter):
             text = ("Use Hermes' real web-search capability for this request; do not answer from memory. "
                     f"Query: {input_data['query']}. " + ("Constraints: " + "; ".join(limits) + ". " if limits else "")
                     + "Return a concise answer with source URLs.")
-        else:
+        elif skill == "research.deep":
             scope = f" Scope: {input_data['scope']}." if input_data.get("scope") else ""
             constraints = []
             if input_data.get("output_format"):
@@ -644,6 +712,8 @@ class YeomanA2AAdapter(BasePlatformAdapter):
                     f"Question: {input_data['question']}.{scope} "
                     + ("Constraints: " + "; ".join(constraints) + ". " if constraints else "")
                     + "Return a report with sources.")
+        else:
+            text = input_data["question"]
         if not text:
             return self._end_task(rec, protocol.STATE_REJECTED, "Empty task — nothing to do.")
         framed = security.wrap_inbound(peer, text)
@@ -667,6 +737,11 @@ class YeomanA2AAdapter(BasePlatformAdapter):
                     f"a2a-research-{task_id}",
                 )
                 return working_task, None
+            if skill == "trading.analyze":
+                message = "Trading analysis is only available on the local Hermes worker."
+                return self._end_task(rec, protocol.STATE_REJECTED, message,
+                                      result_data=self._profile_error(skill, "SKILL_NOT_AVAILABLE", message, rec,
+                                                                      protocol.STATE_REJECTED))
             reply, state = self._forward_to_profile(agent, peer, context_id, framed)
             result_data = (profile.result_for_reply(skill, reply, task_id=task_id, context_id=context_id,
                                                      reference_task_ids=reference_task_ids)
@@ -675,6 +750,19 @@ class YeomanA2AAdapter(BasePlatformAdapter):
             self._record_outcome(task_id, context_id, peer, state, reply, result_data=result_data,
                                  audit_summary=f"profile skill={skill}" if skill else None)
             return protocol.TaskStore.to_task(self.tasks.get(task_id) or rec), None
+        if skill == "trading.analyze":
+            self.tasks.set_state(task_id, protocol.STATE_WORKING)
+            timeout = int(input_data.get("max_duration_seconds", 86400))
+            self.tasks.set_orphan_timeout(task_id, timeout)
+            fut = self._add_pending(task_id, context_id)
+            pending = {"task_id": task_id, "context_id": context_id, "peer": peer, "future": fut,
+                       "created_iso": rec["created_iso"], "started": time.time(), "skill": skill,
+                       "invocation": invocation, "reference_task_ids": reference_task_ids,
+                       "deadline": time.time() + timeout}
+            working_task = protocol.TaskStore.to_task(self.tasks.get(task_id) or rec)
+            _daemon_thread(lambda: self._run_tradingagents(pending), f"a2a-trading-{task_id}")
+            _daemon_thread(lambda: self._background_finalize(pending), f"a2a-trading-finalize-{task_id}")
+            return working_task, None
         if self._loop is None or self._message_handler is None:
             return self._end_task(rec, protocol.STATE_FAILED, "Agent gateway not ready to accept A2A tasks.",
                                   result_data=self._profile_error(skill, "PROCESSING_FAILED", "Agent gateway not ready.", rec) if skill else None)
@@ -692,7 +780,7 @@ class YeomanA2AAdapter(BasePlatformAdapter):
         pending = {"task_id": task_id, "context_id": context_id, "peer": peer, "future": fut,
                    "created_iso": rec["created_iso"], "started": time.time(), "skill": skill, "invocation": invocation,
                    "reference_task_ids": reference_task_ids}
-        if skill == "research.deep":
+        if skill in {"research.deep", "trading.analyze"}:
             timeout = int(invocation["input"].get("max_duration_seconds", 86400))
             self.tasks.set_orphan_timeout(task_id, timeout)
             pending["deadline"] = pending["started"] + timeout

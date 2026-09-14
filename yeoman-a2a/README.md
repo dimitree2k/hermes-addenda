@@ -26,13 +26,19 @@ split is the point: when Hermes grows a generic profile seam, `profile.py` is wh
 |---|---|---|
 | Yeoman → Hermes | `search.web` | Web search via Hermes's configured providers |
 | Yeoman → Hermes | `research.deep` | Long-running research: immediate `WORKING`, then polling to a structured report |
+| Yeoman → Hermes | `trading.analyze` | Long-running analysis through the live native `tradingagents_analyze` tool |
 | Hermes → Yeoman | `whatsapp.send` | Deliver text / image / file / voice to a policy-approved recipient |
 | Hermes → Yeoman | `media.voice.generate` | Produce a voice artifact without sending it |
 
 Behaviour inherited from the profile contract: exactly one authoritative `application/json`
 DataPart per request; schema validation in both directions; Agent Card discovery gated on live
-runtime capability; idempotency by key; stable task/context correlation; a bounded deadline that
+runtime capability (including the native `tradingagents_analyze` binding); idempotency by key; stable task/context correlation; a bounded deadline that
 reports `DEADLINE_EXCEEDED` (retryable) rather than a generic failure.
+
+`trading.analyze` is implemented entirely in this addendum. It dispatches the native tool by its
+registered Hermes name and never routes the request through the generic LLM session. The
+`cfournel/hermes-tradingagents-plugin` repository is not modified, so its updates remain
+independent; the plugin's existing `tradingagents_analyze` registration is the integration point.
 
 ## Install
 

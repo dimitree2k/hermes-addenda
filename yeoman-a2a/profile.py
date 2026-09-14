@@ -28,6 +28,7 @@ _SKILL_REQUESTS = {
     "media.voice.generate": "skills/media.voice.generate/request.schema.json",
     "search.web": "skills/search.web/request.schema.json",
     "research.deep": "skills/research.deep/request.schema.json",
+    "trading.analyze": "skills/trading.analyze/request.schema.json",
 }
 _SKILL_RESPONSES = {
     "conversation": "skills/conversation/response.schema.json",
@@ -35,6 +36,7 @@ _SKILL_RESPONSES = {
     "media.voice.generate": "skills/media.voice.generate/response.schema.json",
     "search.web": "skills/search.web/response.schema.json",
     "research.deep": "skills/research.deep/response.schema.json",
+    "trading.analyze": "skills/trading.analyze/response.schema.json",
 }
 
 
@@ -230,7 +232,7 @@ def result_for_reply(skill: str, reply: str, *, task_id: str = "", context_id: s
         output = {"text": reply or ""}
     elif skill == "search.web":
         output = {"results": [], "answer": reply or ""}
-    elif skill == "research.deep":
+    elif skill in {"research.deep", "trading.analyze"}:
         output = {"report": reply or "", "sources": []}
     else:
         raise ContractViolation(f"Hermes cannot execute skill {skill}")
@@ -276,6 +278,14 @@ def advertised_skills(*, include_voice: bool = False) -> list[dict[str, Any]]:
             "name": "Deep research",
             "description": "Run a potentially long-running research task.",
             "tags": ["research", "async"],
+            "inputModes": ["application/json"],
+            "outputModes": ["application/json", "text/markdown"],
+        },
+        {
+            "id": "trading.analyze",
+            "name": "Trading analysis",
+            "description": "Run a potentially long-running TradingAgents analysis task.",
+            "tags": ["trading", "async"],
             "inputModes": ["application/json"],
             "outputModes": ["application/json", "text/markdown"],
         },
