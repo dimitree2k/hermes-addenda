@@ -21,6 +21,7 @@ from collections import deque
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FuturesTimeout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from gateway.config import Platform
@@ -115,6 +116,17 @@ def _active_profile_name() -> str:
 
 
 def _profile_home(profile: str) -> Optional[str]:
+    if profile and profile != "default":
+        # Served-agent configuration is local operator input, but it still must not be able to
+        # turn a profile name into a path traversal when the Hermes helper is unavailable.
+        try:
+            from hermes_cli.profiles import validate_profile_name
+            validate_profile_name(profile)
+        except ImportError:
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", profile):
+                return None
+        except (TypeError, ValueError):
+            return None
     with contextlib.suppress(Exception):
         from hermes_cli.profiles import get_profile_dir
         return str(get_profile_dir(profile))
@@ -124,6 +136,35 @@ def _profile_home(profile: str) -> Optional[str]:
         from hermes_cli.config import get_hermes_home
         return str(get_hermes_home())
     return None
+
+
+@contextlib.contextmanager
+def _profile_runtime_scope(profile_home: str):
+    """Bind Hermes config, plugin registry, terminal policy, and secrets to one profile.
+
+    The gateway owns the canonical scope implementation. The small fallback keeps the adapter
+    importable with older Hermes builds, but still binds the home and secret scope rather than
+    copying the launch profile's environment into a routed worker.
+    """
+    try:
+        from gateway.run import _profile_runtime_scope as runtime_scope
+    except (ImportError, AttributeError):
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from agent.secret_scope import build_profile_secret_scope, reset_secret_scope, set_secret_scope
+
+        home_token = set_hermes_home_override(profile_home)
+        try:
+            secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
+            try:
+                yield
+            finally:
+                reset_secret_scope(secret_token)
+        finally:
+            reset_hermes_home_override(home_token)
+        return
+
+    with runtime_scope(Path(profile_home)):
+        yield
 
 
 def _daemon_thread(target, name: str) -> threading.Thread:
@@ -466,42 +507,42 @@ class YeomanA2AAdapter(BasePlatformAdapter):
     def _web_search_is_available(self, agent: Optional[dict] = None) -> bool:
         """Only advertise profile web skills when policy and the live registry allow them."""
         try:
-            from tools.registry import registry as tool_registry
-            if not tool_registry.get_definitions({"web_search"}, quiet=True):
-                return False
-            configured = (agent or {}).get("advertised_toolsets") if agent else self._advertised_toolsets
-            if not configured:
-                return True
-            allowed = {str(name) for name in configured}
-            if allowed.intersection({"web_search", "web", "research"}):
-                return True
-            return any("web_search" in tool_registry.get_tool_names_for_toolset(name) for name in allowed)
+            with self._agent_registry(agent) as tool_registry:
+                if not tool_registry.get_definitions({"web_search"}, quiet=True):
+                    return False
+                configured = (agent or {}).get("advertised_toolsets") if agent else self._advertised_toolsets
+                if not configured:
+                    return True
+                allowed = {str(name) for name in configured}
+                if allowed.intersection({"web_search", "web", "research"}):
+                    return True
+                return any("web_search" in tool_registry.get_tool_names_for_toolset(name) for name in allowed)
         except Exception:
             return False
 
     def _tradingagents_is_available(self, agent: Optional[dict] = None) -> bool:
-        """Only advertise trading.analyze when the native TradingAgents tool is live."""
+        """Only advertise trading.analyze when the target profile's native tool is live."""
         try:
-            from tools.registry import registry as tool_registry
-            definitions = tool_registry.get_definitions({_TRADING_TOOL}, quiet=True)
-            if isinstance(definitions, dict):
-                native_tool_live = _TRADING_TOOL in definitions
-            else:
-                native_tool_live = any(
-                    isinstance(definition, dict)
-                    and isinstance(definition.get("function"), dict)
-                    and definition["function"].get("name") == _TRADING_TOOL
-                    for definition in definitions
-                )
-            if not native_tool_live:
-                return False
-            configured = (agent or {}).get("advertised_toolsets") if agent else self._advertised_toolsets
-            if not configured:
-                return True
-            allowed = {str(name) for name in configured}
-            if allowed.intersection({"tradingagents", "trading"}):
-                return True
-            return any(_TRADING_TOOL in tool_registry.get_tool_names_for_toolset(name) for name in allowed)
+            with self._agent_registry(agent) as tool_registry:
+                definitions = tool_registry.get_definitions({_TRADING_TOOL}, quiet=True)
+                if isinstance(definitions, dict):
+                    native_tool_live = _TRADING_TOOL in definitions
+                else:
+                    native_tool_live = any(
+                        isinstance(definition, dict)
+                        and isinstance(definition.get("function"), dict)
+                        and definition["function"].get("name") == _TRADING_TOOL
+                        for definition in definitions
+                    )
+                if not native_tool_live:
+                    return False
+                configured = (agent or {}).get("advertised_toolsets") if agent else self._advertised_toolsets
+                if not configured:
+                    return True
+                allowed = {str(name) for name in configured}
+                if allowed.intersection({"tradingagents", "trading"}):
+                    return True
+                return any(_TRADING_TOOL in tool_registry.get_tool_names_for_toolset(name) for name in allowed)
         except Exception:
             return False
 
@@ -514,47 +555,65 @@ class YeomanA2AAdapter(BasePlatformAdapter):
         ))
         return {"tickers": tickers} if tickers else {}
 
-    def _run_tradingagents(self, pending: dict) -> None:
-        """Run the registered native worker and resolve the existing task future."""
+    def _run_tradingagents(self, pending: dict, agent: Optional[dict] = None) -> None:
+        """Run the registered native worker through Hermes hooks and resolve the task future."""
         try:
-            from tools.registry import registry as tool_registry
-            result = tool_registry.dispatch(
-                _TRADING_TOOL,
-                self._trading_tool_args(pending["invocation"]["input"]["question"]),
-            )
+            question = str(pending["invocation"]["input"].get("question") or "")
+            args = self._trading_tool_args(question)
+            with self._agent_runtime_scope(agent):
+                # Use the same execution boundary as an interactive tool call. This is important
+                # because tradingagents-freshness is a pre_tool_call hook; calling registry.dispatch
+                # directly would bypass its six-hour guard.
+                from model_tools import handle_function_call
+                result = handle_function_call(
+                    _TRADING_TOOL,
+                    args,
+                    task_id=pending["task_id"],
+                    session_id=pending.get("context_id", ""),
+                    user_task=question,
+                )
             payload = result if isinstance(result, dict) else json.loads(result)
-            if not isinstance(payload, dict) or payload.get("error"):
-                raise ValueError("native TradingAgents tool returned an error")
-            output_format = pending["invocation"]["input"].get("output_format")
-            if output_format == "markdown":
-                reports = []
-                for item in payload.get("results", []):
-                    if not isinstance(item, dict):
-                        continue
-                    report = item.get("report") or item.get("decision_summary")
-                    if isinstance(report, str):
-                        reports.append(report.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n"))
-                reply = "\n\n".join(reports)
+            if not isinstance(payload, dict):
+                raise ValueError("native TradingAgents tool returned an invalid result")
+            if payload.get("error"):
+                # The freshness plugin returns the cached report as a deliberate tool-block
+                # message. Preserve it as a completed A2A report; real worker errors remain failed.
+                error = str(payload["error"])
+                if error.startswith("Gültiger TradingAgents-Report für ") and "kein neuer Lauf nötig" in error:
+                    reply = error
+                else:
+                    raise ValueError("native TradingAgents tool returned an error")
             else:
-                # Keep the established native short-result serialization for JSON, brief, and
-                # unspecified requests; only an explicit Markdown request changes presentation.
-                reply = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+                output_format = pending["invocation"]["input"].get("output_format")
+                if output_format == "markdown":
+                    reports = []
+                    for item in payload.get("results", []):
+                        if not isinstance(item, dict):
+                            continue
+                        report = item.get("report") or item.get("decision_summary")
+                        if isinstance(report, str):
+                            reports.append(report.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n"))
+                    reply = "\n\n".join(reports)
+                else:
+                    # Keep the established native short-result serialization for JSON, brief, and
+                    # unspecified requests; only an explicit Markdown request changes presentation.
+                    reply = json.dumps(payload, ensure_ascii=False, sort_keys=True)
             self._resolve_task(pending["task_id"], protocol.STATE_COMPLETED, reply)
         except Exception as exc:
             logger.warning("A2A: TradingAgents task %s failed (%s)", pending["task_id"], type(exc).__name__)
             self._resolve_task(pending["task_id"], protocol.STATE_FAILED, "[trading worker failed]")
 
     def _advertised_skills(self, agent: Optional[dict] = None) -> list[dict]:
-        """Agent Card skills from the live tool registry, restricted by ``advertised_toolsets``;
-        static fallback without a registry."""
+        """Agent Card skills from the target profile's live tool registry, restricted by
+        ``advertised_toolsets``; static fallback without a registry."""
         configured = (agent or {}).get("advertised_toolsets") if agent else self._advertised_toolsets
         try:
-            from tools.registry import registry as tool_registry
-            allowed = set(configured or []) or None
-            mapping = {n: tool_registry.get_tool_names_for_toolset(n)
-                       for n in tool_registry.get_registered_toolset_names() if allowed is None or n in allowed}
-            if mapping:
-                return protocol.skills_from_toolsets(mapping)
+            with self._agent_registry(agent) as tool_registry:
+                allowed = set(configured or []) or None
+                mapping = {n: tool_registry.get_tool_names_for_toolset(n)
+                           for n in tool_registry.get_registered_toolset_names() if allowed is None or n in allowed}
+                if mapping:
+                    return protocol.skills_from_toolsets(mapping)
         except Exception:
             logger.debug("A2A: tool registry unavailable for Agent Card", exc_info=True)
         return protocol.skills_from_toolsets(configured or [])
@@ -592,6 +651,39 @@ class YeomanA2AAdapter(BasePlatformAdapter):
 
     def _scope_for_agent(self, agent: Optional[dict]) -> tuple[str, str]:
         return tuple(str((agent or self._agents[""]).get(k) or "") for k in ("slug", "tenant"))
+
+    def _profile_for_agent(self, agent: Optional[dict]) -> str:
+        """Return the configured target profile for a served agent."""
+        return str((agent or self._agents[""]).get("profile") or self._active_profile).strip()
+
+    def _agent_needs_profile_scope(self, agent: Optional[dict]) -> bool:
+        """A routed profile needs an explicit runtime scope when it is not this process's profile."""
+        target = self._profile_for_agent(agent)
+        return bool(target and target not in {"default", self._active_profile})
+
+    @contextlib.contextmanager
+    def _agent_runtime_scope(self, agent: Optional[dict]):
+        """Enter the target profile without inheriting the launch profile's state or secrets."""
+        if not self._agent_needs_profile_scope(agent):
+            yield
+            return
+        target = self._profile_for_agent(agent)
+        home = _profile_home(target)
+        if not home or not Path(home).is_dir():
+            raise FileNotFoundError(f"served Hermes profile is unavailable: {target}")
+        with _profile_runtime_scope(home):
+            # The target profile has its own user-plugin manager. Discovery is deliberately inside
+            # the scope so registry entries and hooks cannot be registered under the launch profile.
+            from hermes_cli.plugins import discover_plugins
+            discover_plugins()
+            yield
+
+    @contextlib.contextmanager
+    def _agent_registry(self, agent: Optional[dict]):
+        """Yield the registry view belonging to *agent* (global or a routed profile overlay)."""
+        with self._agent_runtime_scope(agent):
+            from tools.registry import registry as tool_registry
+            yield tool_registry
 
     def _forward_lock(self, key: tuple[str, str, str]) -> threading.Lock:
         with self._profile_session_locks_guard:
@@ -752,10 +844,23 @@ class YeomanA2AAdapter(BasePlatformAdapter):
                 )
                 return working_task, None
             if skill == "trading.analyze":
-                message = "Trading analysis is only available on the local Hermes worker."
-                return self._end_task(rec, protocol.STATE_REJECTED, message,
-                                      result_data=self._profile_error(skill, "SKILL_NOT_AVAILABLE", message, rec,
-                                                                      protocol.STATE_REJECTED))
+                self.tasks.set_state(task_id, protocol.STATE_WORKING)
+                timeout = int(input_data.get("max_duration_seconds", 86400))
+                self.tasks.set_orphan_timeout(task_id, timeout)
+                fut = self._add_pending(task_id, context_id)
+                pending = {
+                    "task_id": task_id, "context_id": context_id, "peer": peer, "future": fut,
+                    "created_iso": rec["created_iso"], "started": time.time(), "skill": skill,
+                    "invocation": invocation, "reference_task_ids": reference_task_ids,
+                    "deadline": time.time() + timeout,
+                }
+                working_task = protocol.TaskStore.to_task(self.tasks.get(task_id) or rec)
+                _daemon_thread(
+                    lambda: self._run_tradingagents(pending, agent=agent),
+                    f"a2a-trading-{task_id}",
+                )
+                _daemon_thread(lambda: self._background_finalize(pending), f"a2a-trading-finalize-{task_id}")
+                return working_task, None
             reply, state = self._forward_to_profile(agent, peer, context_id, framed)
             result_data = (profile.result_for_reply(skill, reply, task_id=task_id, context_id=context_id,
                                                      reference_task_ids=reference_task_ids)
@@ -774,7 +879,7 @@ class YeomanA2AAdapter(BasePlatformAdapter):
                        "invocation": invocation, "reference_task_ids": reference_task_ids,
                        "deadline": time.time() + timeout}
             working_task = protocol.TaskStore.to_task(self.tasks.get(task_id) or rec)
-            _daemon_thread(lambda: self._run_tradingagents(pending), f"a2a-trading-{task_id}")
+            _daemon_thread(lambda: self._run_tradingagents(pending, agent=agent), f"a2a-trading-{task_id}")
             _daemon_thread(lambda: self._background_finalize(pending), f"a2a-trading-finalize-{task_id}")
             return working_task, None
         if self._loop is None or self._message_handler is None:
@@ -832,8 +937,26 @@ class YeomanA2AAdapter(BasePlatformAdapter):
                 profile, "SELECT id FROM sessions WHERE title = ? ORDER BY started_at DESC LIMIT 1",
                 (session_title,), "A2A: could not lookup forwarded session")
             cmd = ["hermes", "chat", "-q", framed_text, "-Q", "--source", "a2a"] + (["--resume", session_id] if session_id else [])
-            env = {**os.environ, "HERMES_A2A_PEER": peer}
-            if home := _profile_home(profile):
+            home = _profile_home(profile)
+            if profile and profile != "default" and (not home or not Path(home).is_dir()):
+                return security.redact_outbound(f"Profile dispatch failed: unavailable profile {profile}"), protocol.STATE_FAILED
+            try:
+                from tools.environments.local import served_profile_child_env
+                env = served_profile_child_env(
+                    {**os.environ, "HERMES_A2A_PEER": peer},
+                    target_home=home,
+                    inherit_credentials=True,
+                )
+            except ImportError:
+                # Older Hermes builds do not expose the profile-aware factory. Do not fall back to
+                # the launch environment's credentials; the child loads only its target profile.
+                env = {"PATH": os.environ.get("PATH", ""), "HERMES_A2A_PEER": peer}
+                if home:
+                    env["HERMES_HOME"] = home
+            except Exception as e:
+                return security.redact_outbound(f"Profile dispatch failed: {e}"), protocol.STATE_FAILED
+            env["HERMES_A2A_PEER"] = peer
+            if home:
                 env["HERMES_HOME"] = home
             start = time.time()
             try:
