@@ -794,7 +794,9 @@ class YeomanA2AAdapter(BasePlatformAdapter):
                     payload = self._native_payload(result)
                     if payload.get("error") and not self._is_freshness_block(payload.get("error")):
                         raise _TradingReportError("TRADING_ANALYSIS_FAILED", "TradingAgents analysis failed.")
-                    raw_results = payload.get("results") if isinstance(payload.get("results"), list) else []
+                    raw_results: list[Any] = []
+                    if isinstance(payload.get("results"), list):
+                        raw_results = payload["results"]
                     payload_date = self._markdown_text(payload.get("date")) or requested_date
                     for item in raw_results:
                         if not isinstance(item, dict):
