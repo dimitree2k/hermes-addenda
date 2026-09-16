@@ -17,7 +17,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-CONTRACT_VERSION = "1.0.1"
+CONTRACT_VERSION = "1.0.2"
 PROFILE_URI = "urn:hermes-yeoman:a2a-profile:v1"
 JSON_MEDIA_TYPE = "application/json"
 
@@ -254,7 +254,15 @@ def result_for_reply(skill: str, reply: str, *, task_id: str = "", context_id: s
     elif skill == "search.web":
         output = {"results": [], "answer": reply or ""}
     elif skill in {"research.deep", "trading.analyze"}:
-        output = {"report": reply or "", "sources": []}
+        report = reply or ""
+        if skill == "trading.analyze" and report.lstrip().startswith(("{", "[")):
+            try:
+                parsed = json.loads(report)
+            except (TypeError, json.JSONDecodeError):
+                parsed = None
+            if isinstance(parsed, (dict, list)):
+                raise ContractViolation("trading.analyze report must be Markdown, not a serialized JSON envelope")
+        output = {"report": report, "sources": []}
     else:
         raise ContractViolation(f"Hermes cannot execute skill {skill}")
     validate_skill_response(skill, output)

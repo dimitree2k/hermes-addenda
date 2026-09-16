@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib
 import inspect
 import json
 import logging
@@ -21,6 +22,7 @@ import urllib.request
 from collections import deque
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FuturesTimeout
+from datetime import date as _date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -46,6 +48,21 @@ _TRADING_STOP_WORDS = frozenset({
     "THE", "AND", "FOR", "WITH", "FROM", "THIS", "THAT", "TODAY", "CURRENT", "REPORT",
     "USE", "BUY", "HOLD", "SELL", "RISKS", "RISK", "A2A", "LLM",
 })
+_TRADING_LENGTHS = frozenset({"short", "long", "full"})
+_TRADING_FORMATS = frozenset({"markdown", "json", "brief"})
+_INTERNAL_PATH_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(?:~/?[^\s<>()\[\]`]*hermes[^\s<>()\[\]`]*|/(?:home|opt|srv|tmp|var)/[^\s<>()\[\]`]*hermes[^\s<>()\[\]`]*)"
+)
+_REASONING_MARKER_RE = re.compile(r"^\s*(?:\*\*)?(?:reasoning|plan|planning)(?:\*\*)?\s*:", re.IGNORECASE)
+
+
+class _TradingReportError(ValueError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 #: Reply sentinels used to classify a failed dispatch. A deadline expiry is retryable
 #: and is reported as DEADLINE_EXCEEDED so a peer can tell it apart from a real failure.
 REPLY_TIMEOUT_MARKER = "[agent did not reply in time]"
@@ -603,45 +620,223 @@ class YeomanA2AAdapter(BasePlatformAdapter):
         ))
         return {"tickers": tickers} if tickers else {}
 
-    def _run_tradingagents(self, pending: dict, agent: Optional[dict] = None) -> None:
-        """Run the registered native worker through Hermes hooks and resolve the task future."""
+    @staticmethod
+    def _native_trading_store():
+        """Return the report store belonging to the active native plugin.
+
+        The plugin loader uses a profile-scoped module name, so importing a
+        guessed top-level ``tradingagents`` package can select the upstream
+        dependency instead of Hermes' plugin. Resolve the store through the
+        registered handler first and keep the fallback only for older loaders.
+        """
         try:
-            question = str(pending["invocation"]["input"].get("question") or "")
-            args = self._trading_tool_args(question)
-            with self._agent_runtime_scope(agent):
-                # Use the same execution boundary as an interactive tool call. This is important
-                # because tradingagents-freshness is a pre_tool_call hook; calling registry.dispatch
-                # directly would bypass its six-hour guard.
-                result = self._invoke_native_trading_tool(args, pending, question)
-            payload = result if isinstance(result, dict) else json.loads(result)
-            if not isinstance(payload, dict):
-                raise ValueError("native TradingAgents tool returned an invalid result")
-            if payload.get("error"):
-                # The freshness plugin returns the cached report as a deliberate tool-block
-                # message. Preserve it as a completed A2A report; real worker errors remain failed.
-                error = str(payload["error"])
-                if error.startswith("Gültiger TradingAgents-Report für ") and "kein neuer Lauf nötig" in error:
-                    reply = error
-                else:
-                    raise ValueError("native TradingAgents tool returned an error")
+            from tools.registry import registry
+            entry = registry.get_entry(_TRADING_TOOL)
+            handler = getattr(entry, "handler", None) if entry else None
+            module_name = str(getattr(handler, "__module__", "") or "")
+            if module_name:
+                module = importlib.import_module(module_name)
+                store_module = getattr(module, "store", None)
+                if callable(getattr(store_module, "read_report", None)):
+                    return store_module
+                package = module_name.rsplit(".", 1)[0]
+                store_module = importlib.import_module(f"{package}.store")
+                if callable(getattr(store_module, "read_report", None)):
+                    return store_module
+        except Exception:
+            logger.debug("A2A: native TradingAgents report store unavailable", exc_info=True)
+        for module_name in ("hermes_plugins.tradingagents.store", "tradingagents.store"):
+            try:
+                store_module = importlib.import_module(module_name)
+                if callable(getattr(store_module, "read_report", None)):
+                    return store_module
+            except Exception:
+                continue
+        return None
+
+    @classmethod
+    def _trading_tickers(cls, question: str, store_module=None) -> list[str]:
+        """Resolve the same explicit/watchlist symbols as the native tool."""
+        args = cls._trading_tool_args(question)
+        if args.get("tickers"):
+            return list(args["tickers"])
+        if store_module is not None:
+            try:
+                tickers = store_module.load_watchlist()
+                if isinstance(tickers, list):
+                    return list(dict.fromkeys(str(t).strip().upper() for t in tickers if str(t).strip()))
+            except Exception:
+                logger.debug("A2A: could not read TradingAgents watchlist", exc_info=True)
+        raw = os.getenv("TRADINGAGENTS_WATCHLIST", "")
+        return list(dict.fromkeys(item.strip().upper() for item in raw.split(",") if item.strip()))
+
+    @staticmethod
+    def _markdown_text(value: Any) -> str:
+        """Preserve Markdown while converting transport-escaped line breaks."""
+        if not isinstance(value, str):
+            return ""
+        text = value.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
+        return re.sub(r"\\+(?:r\\+n|n|r)", "\n", text)
+
+    @classmethod
+    def _clean_trading_report(cls, value: Any) -> str:
+        """Return a report body, never the native summary/envelope or tool framing."""
+        text = cls._markdown_text(value)
+        had_trailing_newline = text.endswith("\n")
+        text = text.strip()
+        # Be defensive if a plugin or a test hands the adapter a JSON-encoded
+        # report. The A2A result must contain the report body itself.
+        for _ in range(2):
+            if not text or text[0] not in "{[\"":
+                break
+            try:
+                decoded = json.loads(text)
+            except (TypeError, json.JSONDecodeError):
+                break
+            if isinstance(decoded, str):
+                text = cls._markdown_text(decoded).strip()
+            elif isinstance(decoded, dict) and isinstance(decoded.get("report"), str):
+                text = cls._markdown_text(decoded["report"]).strip()
             else:
-                output_format = pending["invocation"]["input"].get("output_format")
-                if output_format == "markdown":
-                    reports = []
-                    for item in payload.get("results", []):
+                return ""
+        if not text:
+            return ""
+        text = _INTERNAL_PATH_RE.sub("[internal path omitted]", text).replace("```", "")
+        lines = text.splitlines()
+        marker_indexes = [index for index, line in enumerate(lines) if _REASONING_MARKER_RE.match(line)]
+        first_heading = next((index for index, line in enumerate(lines) if line.lstrip().startswith("#")), None)
+        if marker_indexes and first_heading is not None and marker_indexes[0] < first_heading:
+            lines = lines[first_heading:]
+        lines = [line for line in lines if not _REASONING_MARKER_RE.match(line)]
+        cleaned = "\n".join(lines).strip()
+        return cleaned + ("\n" if cleaned and had_trailing_newline else "")
+
+    @staticmethod
+    def _native_payload(result: Any) -> dict:
+        if isinstance(result, dict):
+            payload = result
+        elif isinstance(result, str):
+            try:
+                payload = json.loads(result)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise _TradingReportError("PROCESSING_FAILED", "TradingAgents returned an invalid result.") from exc
+        else:
+            raise _TradingReportError("PROCESSING_FAILED", "TradingAgents returned an invalid result.")
+        if not isinstance(payload, dict):
+            raise _TradingReportError("PROCESSING_FAILED", "TradingAgents returned an invalid result.")
+        return payload
+
+    @staticmethod
+    def _is_freshness_block(error: Any) -> bool:
+        text = str(error or "").lower()
+        return ("kein neuer lauf nötig" in text or "no new run" in text) and "report" in text
+
+    @classmethod
+    def _read_trading_reports(cls, store_module, tickers: list[str], dates: dict[str, str]) -> dict[str, str]:
+        reports: dict[str, str] = {}
+        if store_module is None:
+            return reports
+        for ticker in tickers:
+            try:
+                raw = store_module.read_report(ticker, dates[ticker])
+            except Exception:
+                logger.debug("A2A: could not read TradingAgents report for %s", ticker, exc_info=True)
+                continue
+            if report := cls._clean_trading_report(raw):
+                reports[ticker] = report
+        return reports
+
+    def _run_tradingagents(self, pending: dict, agent: Optional[dict] = None) -> None:
+        """Run once when needed, then resolve from complete stored Markdown reports."""
+        try:
+            input_data = pending["invocation"]["input"]
+            length = input_data.get("length", "short") or "short"
+            output_format = input_data.get("output_format", "markdown") or "markdown"
+            if not isinstance(length, str) or length not in _TRADING_LENGTHS:
+                raise _TradingReportError("INVALID_LENGTH", "length must be one of: short, long, full")
+            if not isinstance(output_format, str) or output_format not in _TRADING_FORMATS:
+                raise _TradingReportError("INVALID_FORMAT", "output_format is not supported")
+            pending["length"], pending["output_format"] = length, output_format
+            question = str(input_data.get("question") or "")
+            requested_date = str(input_data.get("date") or _date.today().isoformat()).strip()
+            native_args = self._trading_tool_args(question)
+            with self._agent_runtime_scope(agent):
+                store_module = self._native_trading_store()
+                tickers = self._trading_tickers(question, store_module)
+                dates = {ticker: requested_date for ticker in tickers}
+                reports = self._read_trading_reports(store_module, tickers, dates)
+                missing = [ticker for ticker in tickers if ticker not in reports]
+                if not tickers and length in {"long", "full"}:
+                    raise _TradingReportError(
+                        "REPORT_NOT_FOUND", "No stored TradingAgents report is available for a long or full response."
+                    )
+                if missing and length in {"long", "full"}:
+                    names = ", ".join(missing)
+                    raise _TradingReportError(
+                        "REPORT_NOT_FOUND",
+                        f"No stored TradingAgents report for {names} on {requested_date}; run a short analysis first.",
+                    )
+
+                payload: dict = {}
+                if missing or not tickers:
+                    run_args = dict(native_args)
+                    if missing:
+                        run_args["tickers"] = missing
+                    elif tickers:
+                        run_args["tickers"] = tickers
+                    # These are execution metadata, not compatibility aliases;
+                    # Yeoman still receives the complete report below.
+                    run_args["output_format"] = output_format
+                    run_args["length"] = length
+                    if input_data.get("date"):
+                        run_args["date"] = requested_date
+                    result = self._invoke_native_trading_tool(run_args, pending, question)
+                    payload = self._native_payload(result)
+                    if payload.get("error") and not self._is_freshness_block(payload.get("error")):
+                        raise _TradingReportError("TRADING_ANALYSIS_FAILED", "TradingAgents analysis failed.")
+                    raw_results = payload.get("results") if isinstance(payload.get("results"), list) else []
+                    payload_date = self._markdown_text(payload.get("date")) or requested_date
+                    for item in raw_results:
                         if not isinstance(item, dict):
                             continue
-                        report = item.get("report") or item.get("decision_summary")
-                        if isinstance(report, str):
-                            reports.append(report.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n"))
-                    reply = "\n\n".join(reports)
-                else:
-                    # Keep the established native short-result serialization for JSON, brief, and
-                    # unspecified requests; only an explicit Markdown request changes presentation.
-                    reply = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+                        ticker = str(item.get("ticker") or "").strip().upper()
+                        if not ticker:
+                            continue
+                        if ticker not in tickers:
+                            tickers.append(ticker)
+                        dates[ticker] = self._markdown_text(item.get("date")) or payload_date
+                    reports.update(self._read_trading_reports(store_module, tickers, dates))
+                    # A full report in a direct native response is acceptable
+                    # only when no plugin store is available; a loaded store is
+                    # authoritative and must be read back after the run.
+                    if store_module is None:
+                        for item in raw_results:
+                            if not isinstance(item, dict):
+                                continue
+                            ticker = str(item.get("ticker") or "").strip().upper()
+                            if ticker and (report := self._clean_trading_report(item.get("report"))):
+                                reports[ticker] = report
+
+                if not tickers:
+                    tickers = list(reports)
+                if not reports or any(ticker not in reports for ticker in tickers):
+                    missing_names = ", ".join(ticker for ticker in tickers if ticker not in reports) or "requested ticker"
+                    raise _TradingReportError(
+                        "REPORT_NOT_FOUND",
+                        f"No complete stored TradingAgents report is available for {missing_names} on {requested_date}.",
+                    )
+                # Yeoman owns short/long/full rendering. The profile always
+                # returns the full Markdown body so a short request is lossless.
+                reply = "\n\n".join(reports[ticker] for ticker in tickers if ticker in reports)
+                if not reply:
+                    raise _TradingReportError("REPORT_NOT_FOUND", "The stored TradingAgents report is empty.")
             self._resolve_task(pending["task_id"], protocol.STATE_COMPLETED, reply)
+        except _TradingReportError as exc:
+            pending["failure"] = {"code": exc.code, "message": exc.message}
+            self._resolve_task(pending["task_id"], protocol.STATE_FAILED, f"[{exc.code}] {exc.message}")
         except Exception as exc:
             logger.warning("A2A: TradingAgents task %s failed (%s)", pending["task_id"], type(exc).__name__)
+            pending["failure"] = {"code": "PROCESSING_FAILED", "message": "TradingAgents result processing failed."}
             self._resolve_task(pending["task_id"], protocol.STATE_FAILED, "[trading worker failed]")
 
     def _advertised_skills(self, agent: Optional[dict] = None) -> list[dict]:
@@ -1063,7 +1258,10 @@ class YeomanA2AAdapter(BasePlatformAdapter):
                     state, reply = protocol.STATE_FAILED, "[agent produced no valid profile result]"
                     result_data = self._profile_error(skill, "PROCESSING_FAILED", "Agent processing failed.", rec, state)
             elif state != protocol.STATE_INPUT_REQUIRED:
-                if reply == REPLY_TIMEOUT_MARKER:
+                failure = pending.get("failure") or {}
+                if isinstance(failure, dict) and failure.get("code") and failure.get("message"):
+                    result_data = self._profile_error(skill, str(failure["code"]), str(failure["message"]), rec, state)
+                elif reply == REPLY_TIMEOUT_MARKER:
                     result_data = self._profile_error(skill, "DEADLINE_EXCEEDED",
                                                       "The task exceeded its deadline before a reply was produced.",
                                                       rec, state, retryable=True)

@@ -23,7 +23,7 @@ description: >
 
   Requires the pinned contract package (declare-only: Hermes surfaces it, never
   auto-installs it):
-      pip install "hermes-yeoman-a2a-contracts==1.0.1"
+      pip install "hermes-yeoman-a2a-contracts==1.0.2"
 
   Pure stdlib transport (http.server + urllib) -- no a2a-sdk dependency required.
 author: dimitree2k
@@ -35,7 +35,7 @@ provides_tools:
   - a2a_history
   - a2a_orchestrate
 python_dependencies:
-  - "hermes-yeoman-a2a-contracts==1.0.1"
+  - "hermes-yeoman-a2a-contracts==1.0.2"
 # requires_env / optional_env are surfaced in the `hermes config` UI via the
 # platform-plugin env var injector in hermes_cli/config.py.
 requires_env: []

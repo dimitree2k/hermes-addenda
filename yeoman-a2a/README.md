@@ -37,14 +37,15 @@ reports `DEADLINE_EXCEEDED` (retryable) rather than a generic failure.
 
 `trading.analyze` is implemented entirely in this addendum. It dispatches the native tool by its
 registered Hermes name and never routes the request through the generic LLM session. The
-`cfournel/hermes-tradingagents-plugin` repository is not modified, so its updates remain
-independent; the plugin's existing `tradingagents_analyze` registration is the integration point.
+`tradingagents_analyze` registration is the integration point: the adapter forwards the contract's
+`length`/`output_format` metadata and reads the plugin's persisted full report rather than the
+trimmed tool summary.
 
 ## Install
 
 ```bash
 hermes plugins install dimitree2k/hermes-addenda/yeoman-a2a --no-enable
-pip install "hermes-yeoman-a2a-contracts==1.0.1"   # declare-only; Hermes never auto-installs it
+pip install "hermes-yeoman-a2a-contracts==1.0.2"   # declare-only; Hermes never auto-installs it
 hermes plugins enable yeoman-a2a
 hermes gateway restart
 ```

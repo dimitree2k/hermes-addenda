@@ -19,7 +19,7 @@ from typing import Any, Optional
 from gateway.platforms._shared import coerce_port as _coerce_int
 
 PROTOCOL_VERSION = "1.0"
-AGENT_CARD_VERSION = "1.0.1"
+AGENT_CARD_VERSION = "1.0.2"
 
 # A2A v1.0 task lifecycle states + message roles.
 STATE_SUBMITTED, STATE_WORKING, STATE_INPUT_REQUIRED = "TASK_STATE_SUBMITTED", "TASK_STATE_WORKING", "TASK_STATE_INPUT_REQUIRED"

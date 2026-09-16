@@ -66,7 +66,7 @@ def test_contract_loader_rejects_previous_release(tmp_path, monkeypatch):
     )
     monkeypatch.setenv("A2A_CONTRACTS_PATH", str(old_checkout))
 
-    with pytest.raises(contract.ContractViolation, match="expected 1.0.1"):
+    with pytest.raises(contract.ContractViolation, match="expected 1.0.2"):
         contract.contract_root()
 
 
@@ -188,7 +188,7 @@ def test_profile_error_status_matches_failed_task():
 
 def test_profile_client_sends_only_the_structured_datapart(monkeypatch):
     card = {
-        "version": "1.0.1",
+        "version": "1.0.2",
         "capabilities": {"extensions": [{"uri": contract.PROFILE_URI, "required": False}]},
         "skills": [{"id": "whatsapp.send", "inputModes": ["application/json"], "outputModes": ["application/json"]}],
         "defaultInputModes": ["text/plain", "application/json"],
@@ -231,7 +231,7 @@ def test_profile_client_sends_only_the_structured_datapart(monkeypatch):
 
 def test_profile_client_refuses_unadvertised_skill(monkeypatch):
     monkeypatch.setattr(tools, "_fetch_card", lambda *args: {
-        "version": "1.0.1",
+        "version": "1.0.2",
         "capabilities": {"extensions": [{"uri": contract.PROFILE_URI, "required": False}]},
         "skills": [{"id": "conversation"}],
     })
@@ -299,7 +299,7 @@ def test_profile_rpc_endpoint_stays_on_configured_origin():
 
 def test_profile_client_rejects_missing_profile_extension(monkeypatch):
     monkeypatch.setattr(tools, "_fetch_card", lambda *args: {
-        "version": "1.0.1",
+        "version": "1.0.2",
         "capabilities": {"extensions": []},
         "skills": [{"id": "conversation"}],
     })
@@ -310,7 +310,7 @@ def test_profile_client_rejects_missing_profile_extension(monkeypatch):
 def test_profile_retry_reuses_persisted_outbound_context(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     card = {
-        "version": "1.0.1",
+        "version": "1.0.2",
         "extensions": [{"uri": contract.PROFILE_URI, "required": False}],
         "skills": [{"id": "whatsapp.send", "inputModes": ["application/json"], "outputModes": ["application/json"]}],
         "defaultInputModes": ["application/json"],
@@ -349,7 +349,7 @@ def test_profile_retry_reuses_persisted_outbound_context(monkeypatch, tmp_path):
 def test_profile_client_rejects_same_idempotency_key_with_different_input(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     card = {
-        "version": "1.0.1",
+        "version": "1.0.2",
         "extensions": [{"uri": contract.PROFILE_URI, "required": False}],
         "skills": [{"id": "research.deep", "inputModes": ["application/json"], "outputModes": ["application/json"]}],
         "supportedInterfaces": [{"url": "http://peer/a2a", "protocolBinding": "JSONRPC", "protocolVersion": "1.0"}],
@@ -370,7 +370,7 @@ def test_profile_client_rejects_same_idempotency_key_with_different_input(monkey
 
 def test_profile_client_omits_missing_interface_tenant(monkeypatch):
     card = {
-        "version": "1.0.1",
+        "version": "1.0.2",
         "extensions": [{"uri": contract.PROFILE_URI, "required": False}],
         "skills": [{"id": "research.deep", "inputModes": ["application/json"], "outputModes": ["application/json"]}],
         "supportedInterfaces": [{"url": "http://peer/a2a", "protocolBinding": "JSONRPC", "protocolVersion": "1.0"}],
@@ -650,6 +650,12 @@ def test_trading_analyze_dispatches_native_worker_without_llm_session(monkeypatc
     background = []
     monkeypatch.setattr(a2a_adapter, "_daemon_thread", lambda target, _name: background.append(target))
     calls = []
+    full_report = "# AAPL — Analyse\n\n## Entscheidung\n\n**HOLD** — retained.\n\n## Begründung\n\n- Valuation\n- Risk balance\n\n## Fundamentaldaten\n\nStable.\n\n## Risiken\n\nMarket volatility."
+    fake_store = SimpleNamespace(
+        load_watchlist=lambda: ["AAPL"],
+        read_report=lambda ticker, trade_date: full_report if ticker == "AAPL" and trade_date == "2026-09-14" else "",
+    )
+    adapter._native_trading_store = lambda: fake_store  # type: ignore[method-assign]
 
     def dispatch(name, args):
         calls.append((name, args))
@@ -683,15 +689,18 @@ def test_trading_analyze_dispatches_native_worker_without_llm_session(monkeypatc
     background[0]()
     background[1]()
     record = adapter.tasks.get(task["id"])
-    assert calls == [("tradingagents_analyze", {"tickers": ["AAPL"]})]
+    assert calls == [("tradingagents_analyze", {
+        "tickers": ["AAPL"], "output_format": "markdown", "length": "short",
+    })]
     assert record["state"] == protocol.STATE_COMPLETED
     assert record["result_data"]["skill"] == "trading.analyze"
     report = record["result_data"]["output"]["report"]
+    assert report.startswith("# AAPL — Analyse")
     assert not report.startswith(("{", "["))
     assert "\n" in report
     assert r"\n" not in report
-    assert "## Portfolio Manager" in report
-    assert "**Final Rating: Underweight KO (NYQ)**" in report
+    assert "## Entscheidung" in report
+    assert "## Begründung" in report
     assert record["result_data"]["output"]["sources"] == []
 
 
@@ -701,7 +710,16 @@ def _run_native_trading_reply(monkeypatch, payload, output_format):
     adapter = A2AAdapter(PlatformConfig(enabled=True))
     resolved = []
     adapter._resolve_task = lambda task_id, state, reply: resolved.append((task_id, state, reply))  # type: ignore[method-assign]
-    monkeypatch.setattr(registry, "dispatch", lambda *_args: json.dumps(payload))
+    stored = {
+        str(item.get("ticker", "")).upper(): item.get("report") or item.get("decision_summary") or ""
+        for item in payload.get("results", []) if isinstance(item, dict)
+    }
+    invoked = {"value": False}
+    adapter._native_trading_store = lambda: SimpleNamespace(
+        load_watchlist=lambda: list(stored),
+        read_report=lambda ticker, _date: stored.get(str(ticker).upper(), "") if invoked["value"] else "",
+    )  # type: ignore[method-assign]
+    monkeypatch.setattr(registry, "dispatch", lambda *_args: (invoked.__setitem__("value", True), json.dumps(payload))[1])
     pending = {
         "task_id": "task-format",
         "invocation": {"input": {"question": "Analyse KO.", "output_format": output_format}},
@@ -739,11 +757,19 @@ def test_trading_analyze_formats_multiple_markdown_results(monkeypatch):
     assert r"\n" not in report
 
 
-def test_trading_analyze_keeps_explicit_json_reply(monkeypatch):
-    payload = {"date": "2026-09-16", "results": [{"ticker": "KO", "decision": "Underweight"}]}
+def test_trading_analyze_keeps_markdown_report_for_explicit_json_native_metadata(monkeypatch):
+    payload = {
+        "date": "2026-09-16",
+        "results": [{
+            "ticker": "KO",
+            "date": "2026-09-16",
+            "decision": "Underweight",
+            "report": "# KO — Analyse\n\n## Entscheidung\n\n**HOLD** — retained.",
+        }],
+    }
 
     reply = _run_native_trading_reply(monkeypatch, payload, "json")
-    assert reply == json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    assert reply == payload["results"][0]["report"]
 
 
 def test_research_text_does_not_activate_native_trading_tool(monkeypatch):
