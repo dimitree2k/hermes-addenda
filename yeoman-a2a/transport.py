@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 import os
@@ -546,6 +547,53 @@ class YeomanA2AAdapter(BasePlatformAdapter):
         except Exception:
             return False
 
+    def _agent_profile_is_available(self, agent: Optional[dict] = None) -> bool:
+        """Reject a routed agent whose target profile does not exist.
+
+        Capability checks normally enter the target scope themselves, but callers
+        and tests may replace those checks. Keeping profile existence as a separate
+        routing invariant prevents a missing profile from being reported as WORKING
+        and failing only in a background thread.
+        """
+        if not self._agent_needs_profile_scope(agent):
+            return True
+        home = _profile_home(self._profile_for_agent(agent))
+        return bool(home and Path(home).is_dir())
+
+    @staticmethod
+    def _native_registry_accepts_context(registry) -> bool:
+        """Whether the installed registry supports Hermes call metadata.
+
+        Older plugin test doubles (and older Hermes registries) accepted only
+        ``dispatch(name, args)``. Prefer ``handle_function_call`` whenever the
+        live registry supports keyword context so hooks such as freshness remain
+        on the execution path; use the narrow legacy call only when its signature
+        proves that metadata is unsupported.
+        """
+        try:
+            params = inspect.signature(registry.dispatch).parameters
+        except (TypeError, ValueError):
+            return True
+        return any(parameter.kind == inspect.Parameter.VAR_KEYWORD
+                   for parameter in params.values()) or all(
+            name in params for name in ("task_id", "session_id")
+        )
+
+    def _invoke_native_trading_tool(self, args: dict, pending: dict, question: str):
+        from tools.registry import registry
+        if not self._native_registry_accepts_context(registry):
+            # Compatibility path for pre-context registries only. Current Hermes
+            # always takes the hook-aware path below.
+            return registry.dispatch(_TRADING_TOOL, args)
+        from model_tools import handle_function_call
+        return handle_function_call(
+            _TRADING_TOOL,
+            args,
+            task_id=pending["task_id"],
+            session_id=pending.get("context_id", ""),
+            user_task=question,
+        )
+
     @staticmethod
     def _trading_tool_args(question: str) -> dict:
         """Pass explicit symbols when present; otherwise let the native tool use its watchlist."""
@@ -564,14 +612,7 @@ class YeomanA2AAdapter(BasePlatformAdapter):
                 # Use the same execution boundary as an interactive tool call. This is important
                 # because tradingagents-freshness is a pre_tool_call hook; calling registry.dispatch
                 # directly would bypass its six-hour guard.
-                from model_tools import handle_function_call
-                result = handle_function_call(
-                    _TRADING_TOOL,
-                    args,
-                    task_id=pending["task_id"],
-                    session_id=pending.get("context_id", ""),
-                    user_task=question,
-                )
+                result = self._invoke_native_trading_tool(args, pending, question)
             payload = result if isinstance(result, dict) else json.loads(result)
             if not isinstance(payload, dict):
                 raise ValueError("native TradingAgents tool returned an invalid result")
@@ -654,7 +695,8 @@ class YeomanA2AAdapter(BasePlatformAdapter):
 
     def _profile_for_agent(self, agent: Optional[dict]) -> str:
         """Return the configured target profile for a served agent."""
-        return str((agent or self._agents[""]).get("profile") or self._active_profile).strip()
+        entry = agent or self._agents[""]
+        return str(entry.get("profile") or entry.get("slug") or self._active_profile).strip()
 
     def _agent_needs_profile_scope(self, agent: Optional[dict]) -> bool:
         """A routed profile needs an explicit runtime scope when it is not this process's profile."""
@@ -777,6 +819,11 @@ class YeomanA2AAdapter(BasePlatformAdapter):
                                                                   protocol.STATE_REJECTED) if skill else None)
         if skill not in {"conversation", "search.web", "research.deep", "trading.analyze"}:
             message = "Requested profile skill is unavailable."
+            return self._end_task(rec, protocol.STATE_REJECTED, message,
+                                  result_data=self._profile_error(skill, "SKILL_NOT_AVAILABLE", message, rec,
+                                                                  protocol.STATE_REJECTED))
+        if not self._agent_profile_is_available(agent):
+            message = "Requested Hermes profile is unavailable."
             return self._end_task(rec, protocol.STATE_REJECTED, message,
                                   result_data=self._profile_error(skill, "SKILL_NOT_AVAILABLE", message, rec,
                                                                   protocol.STATE_REJECTED))

@@ -39,6 +39,15 @@ _SKILL_RESPONSES = {
     "trading.analyze": "skills/trading.analyze/response.schema.json",
 }
 
+# A resolver must not select a same-version-looking checkout that only contains a
+# partial schema tree. In particular, an old local checkout can have the common
+# schema while missing the trading response schema that the installed wheel has.
+# Keep the baseline explicit so a new skill cannot be silently accepted until its
+# request and response schemas are present in every runtime contract source.
+_REQUIRED_SCHEMAS = frozenset({
+    f"common/{name}.schema.json" for name in ("invocation", "result")
+} | set(_SKILL_REQUESTS.values()) | set(_SKILL_RESPONSES.values()))
+
 
 class ContractViolation(ValueError):
     """A payload violates the Hermes/Yeoman profile or a skill schema."""
@@ -101,6 +110,18 @@ def contract_root() -> Path:
     for root in _contract_roots():
         if (root / "schemas" / "common" / "invocation.schema.json").is_file():
             _assert_contract_version(root)
+            missing = [relative for relative in sorted(_REQUIRED_SCHEMAS)
+                       if not (root / "schemas" / relative).is_file()]
+            if missing:
+                # An explicitly configured path is allowed to fall through to
+                # the installed package only when it is incomplete. Version
+                # mismatches still raise above: silently accepting those would
+                # make an operator's incompatible override look valid.
+                logger.warning(
+                    "A2A: ignoring incomplete contract root %s; missing %s",
+                    root, ", ".join(missing),
+                )
+                continue
             return root
     raise ContractViolation(
         f"Hermes/Yeoman contract v{CONTRACT_VERSION} is not installed; set A2A_CONTRACTS_PATH to a pinned checkout"
