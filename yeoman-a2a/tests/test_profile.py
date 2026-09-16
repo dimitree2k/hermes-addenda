@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-
 from agent import secret_scope
 from gateway.config import PlatformConfig
+from yeoman_a2a import profile as contract
+from yeoman_a2a import protocol, tools
 from yeoman_a2a import transport as a2a_adapter
-from yeoman_a2a import profile as contract, protocol, tools
 from yeoman_a2a.transport import YeomanA2AAdapter as A2AAdapter
 
 
@@ -652,12 +653,24 @@ def test_trading_analyze_dispatches_native_worker_without_llm_session(monkeypatc
 
     def dispatch(name, args):
         calls.append((name, args))
-        return '{"date":"2026-09-14","results":[]}'
+        return json.dumps({
+            "date": "2026-09-14",
+            "results": [{
+                "ticker": "AAPL",
+                "date": "2026-09-14",
+                "decision": "Underweight",
+                "decision_summary": r"Trend bleibt schwach.\nRisiken überwiegen.",
+            }],
+        })
 
     monkeypatch.setattr(registry, "dispatch", dispatch)
     invocation = {
         "skill": "trading.analyze",
-        "input": {"question": "Analyse AAPL.", "idempotency_key": "trading-001"},
+        "input": {
+            "question": "Analyse AAPL.",
+            "output_format": "markdown",
+            "idempotency_key": "trading-001",
+        },
     }
     task, pending = adapter._prepare_task(
         {"message": protocol.structured_message(protocol.ROLE_USER, invocation, context_id="ctx-trading")},
@@ -673,6 +686,53 @@ def test_trading_analyze_dispatches_native_worker_without_llm_session(monkeypatc
     assert calls == [("tradingagents_analyze", {"tickers": ["AAPL"]})]
     assert record["state"] == protocol.STATE_COMPLETED
     assert record["result_data"]["skill"] == "trading.analyze"
+    report = record["result_data"]["output"]["report"]
+    assert not report.startswith("{")
+    assert "\n" in report
+    assert r"\n" not in report
+    assert "AAPL" in report and "Underweight" in report
+    assert "Trend bleibt schwach.\nRisiken überwiegen." in report
+
+
+def _run_native_trading_reply(monkeypatch, payload, output_format):
+    from tools.registry import registry
+
+    adapter = A2AAdapter(PlatformConfig(enabled=True))
+    resolved = []
+    adapter._resolve_task = lambda task_id, state, reply: resolved.append((task_id, state, reply))  # type: ignore[method-assign]
+    monkeypatch.setattr(registry, "dispatch", lambda *_args: json.dumps(payload))
+    pending = {
+        "task_id": "task-format",
+        "invocation": {"input": {"question": "Analyse KO.", "output_format": output_format}},
+    }
+
+    adapter._run_tradingagents(pending)
+    assert resolved[0][0:2] == ("task-format", protocol.STATE_COMPLETED)
+    return resolved[0][2]
+
+
+def test_trading_analyze_formats_multiple_markdown_results(monkeypatch):
+    payload = {
+        "date": "2026-09-16",
+        "results": [
+            {"ticker": "KO", "date": "2026-09-16", "decision": "Underweight", "decision_summary": "First."},
+            {"ticker": "MSFT", "date": "2026-09-16", "decision": "Overweight", "decision_summary": "Second."},
+        ],
+    }
+
+    report = _run_native_trading_reply(monkeypatch, payload, "markdown")
+    assert report.count("\n# ") + int(report.startswith("# ")) == 2
+    assert "\n\n# MSFT – TradingAgents-Analyse (2026-09-16)" in report
+    assert report.index("# KO") < report.index("# MSFT")
+    assert "Underweight" in report and "Overweight" in report
+    assert r"\n" not in report
+
+
+def test_trading_analyze_keeps_explicit_json_reply(monkeypatch):
+    payload = {"date": "2026-09-16", "results": [{"ticker": "KO", "decision": "Underweight"}]}
+
+    reply = _run_native_trading_reply(monkeypatch, payload, "json")
+    assert reply == json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
 def test_research_text_does_not_activate_native_trading_tool(monkeypatch):
