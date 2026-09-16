@@ -659,7 +659,7 @@ def test_trading_analyze_dispatches_native_worker_without_llm_session(monkeypatc
                 "ticker": "AAPL",
                 "date": "2026-09-14",
                 "decision": "Underweight",
-                "decision_summary": r"Trend bleibt schwach.\nRisiken überwiegen.",
+                "decision_summary": r"## Portfolio Manager\n\n**Final Rating: Underweight KO (NYQ)**\n\nThe debate supports an underweight position.",
             }],
         })
 
@@ -687,11 +687,12 @@ def test_trading_analyze_dispatches_native_worker_without_llm_session(monkeypatc
     assert record["state"] == protocol.STATE_COMPLETED
     assert record["result_data"]["skill"] == "trading.analyze"
     report = record["result_data"]["output"]["report"]
-    assert not report.startswith("{")
+    assert not report.startswith(("{", "["))
     assert "\n" in report
     assert r"\n" not in report
-    assert "AAPL" in report and "Underweight" in report
-    assert "Trend bleibt schwach.\nRisiken überwiegen." in report
+    assert "## Portfolio Manager" in report
+    assert "**Final Rating: Underweight KO (NYQ)**" in report
+    assert record["result_data"]["output"]["sources"] == []
 
 
 def _run_native_trading_reply(monkeypatch, payload, output_format):
@@ -715,16 +716,26 @@ def test_trading_analyze_formats_multiple_markdown_results(monkeypatch):
     payload = {
         "date": "2026-09-16",
         "results": [
-            {"ticker": "KO", "date": "2026-09-16", "decision": "Underweight", "decision_summary": "First."},
-            {"ticker": "MSFT", "date": "2026-09-16", "decision": "Overweight", "decision_summary": "Second."},
+            {
+                "ticker": "KO",
+                "date": "2026-09-16",
+                "decision": "Underweight",
+                "decision_summary": r"## Portfolio Manager\n\n**Final Rating: Underweight KO (NYQ)**",
+            },
+            {
+                "ticker": "MSFT",
+                "date": "2026-09-16",
+                "decision": "Overweight",
+                "decision_summary": r"## Portfolio Manager\n\n**Final Rating: Overweight MSFT (NMS)**",
+            },
         ],
     }
 
     report = _run_native_trading_reply(monkeypatch, payload, "markdown")
-    assert report.count("\n# ") + int(report.startswith("# ")) == 2
-    assert "\n\n# MSFT – TradingAgents-Analyse (2026-09-16)" in report
-    assert report.index("# KO") < report.index("# MSFT")
-    assert "Underweight" in report and "Overweight" in report
+    assert report.count("## Portfolio Manager") == 2
+    assert "\n\n## Portfolio Manager" in report
+    assert "**Final Rating: Underweight KO (NYQ)**" in report
+    assert "**Final Rating: Overweight MSFT (NMS)**" in report
     assert r"\n" not in report
 
 

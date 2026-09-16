@@ -23,10 +23,11 @@ from concurrent.futures import TimeoutError as FuturesTimeout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional
 
+from gateway.config import Platform
+from gateway.platforms._shared import coerce_port as _to_int
+from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
-from gateway.config import Platform
-from gateway.platforms._shared import coerce_port as _to_int, get_scoped_secret as _get_scoped_secret
 
 from . import profile, protocol, security
 
@@ -513,36 +514,6 @@ class YeomanA2AAdapter(BasePlatformAdapter):
         ))
         return {"tickers": tickers} if tickers else {}
 
-    @staticmethod
-    def _markdown_text(value: Any) -> str:
-        """Keep native text as Markdown while turning escaped newlines into line breaks."""
-        if not isinstance(value, str):
-            return ""
-        text = value.replace("\r\n", "\n").replace("\r", "\n")
-        return re.sub(r"\\+r\\+n|\\+n|\\+r", "\n", text)
-
-    @classmethod
-    def _trading_markdown_report(cls, payload: dict) -> str:
-        """Render the native structured summary as the profile's Markdown report."""
-        raw_results = payload.get("results")
-        results = raw_results if isinstance(raw_results, list) else []
-        default_date = cls._markdown_text(payload.get("date")) or "unbekannt"
-        blocks = []
-        for result in results:
-            if not isinstance(result, dict):
-                continue
-            ticker = cls._markdown_text(result.get("ticker")) or "Unbekannter Ticker"
-            date = cls._markdown_text(result.get("date")) or default_date
-            decision = cls._markdown_text(result.get("decision")) or "Nicht verfügbar"
-            block = (
-                f"# {ticker} – TradingAgents-Analyse ({date})\n\n"
-                f"## Entscheidung\n\n**{decision}**"
-            )
-            if summary := cls._markdown_text(result.get("decision_summary")):
-                block += f"\n\n{summary}"
-            blocks.append(block)
-        return "\n\n".join(blocks) or "# TradingAgents-Analyse\n\nKeine Ergebnisse."
-
     def _run_tradingagents(self, pending: dict) -> None:
         """Run the registered native worker and resolve the existing task future."""
         try:
@@ -555,10 +526,19 @@ class YeomanA2AAdapter(BasePlatformAdapter):
             if not isinstance(payload, dict) or payload.get("error"):
                 raise ValueError("native TradingAgents tool returned an error")
             output_format = pending["invocation"]["input"].get("output_format")
-            # Keep the established native short-result serialization for JSON, brief, and
-            # unspecified requests; only an explicit Markdown request changes presentation.
-            reply = (self._trading_markdown_report(payload) if output_format == "markdown"
-                     else json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            if output_format == "markdown":
+                reports = []
+                for item in payload.get("results", []):
+                    if not isinstance(item, dict):
+                        continue
+                    report = item.get("report") or item.get("decision_summary")
+                    if isinstance(report, str):
+                        reports.append(report.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n"))
+                reply = "\n\n".join(reports)
+            else:
+                # Keep the established native short-result serialization for JSON, brief, and
+                # unspecified requests; only an explicit Markdown request changes presentation.
+                reply = json.dumps(payload, ensure_ascii=False, sort_keys=True)
             self._resolve_task(pending["task_id"], protocol.STATE_COMPLETED, reply)
         except Exception as exc:
             logger.warning("A2A: TradingAgents task %s failed (%s)", pending["task_id"], type(exc).__name__)
