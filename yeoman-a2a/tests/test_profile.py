@@ -823,3 +823,18 @@ def test_a2a_skill_call_uses_strict_profile_client(monkeypatch):
     monkeypatch.setattr(tools, "_send_profile_invocation", lambda *args: {"result": {"status": "completed"}})
     assert '"completed"' in tools.a2a_skill_call({"agent": "yeoman", "skill": "conversation", "input": {"text": "hi"}})
     assert "required" in tools.a2a_skill_call({"agent": "yeoman", "skill": "conversation", "input": "hi"})
+
+
+def test_cancel_task_is_terminal_and_idempotent(monkeypatch):
+    adapter = A2AAdapter(PlatformConfig(enabled=True))
+    record = adapter.tasks.create("cancel-task", "cancel-context", "yeoman")
+    adapter.tasks.set_state(record["task_id"], protocol.STATE_WORKING)
+    resolved = []
+    monkeypatch.setattr(adapter, "_resolve_task", lambda *args: resolved.append(args))
+
+    canceled = adapter._rpc_tasks_cancel("request-1", {"taskId": record["task_id"]})
+    second = adapter._rpc_tasks_cancel("request-2", {"taskId": record["task_id"]})
+
+    assert canceled["result"]["status"]["state"] == protocol.STATE_CANCELED
+    assert second["error"]["code"] == protocol.ERR_TASK_NOT_CANCELABLE
+    assert len(resolved) == 1
