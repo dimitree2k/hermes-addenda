@@ -106,6 +106,40 @@ def test_all_lengths_return_the_same_lossless_stored_report_without_rerun(monkey
     assert store_calls == [("AAPL", "2026-09-17")]
 
 
+def test_native_canonical_ticker_replaces_unresolved_company_aliases(monkeypatch):
+    calls_to_store: list[tuple[str, str]] = []
+    ran = {"value": False}
+    sk_report = FULL_REPORT.replace("# AAPL — Analyse", "# SK Hynix — Analyse", 1)
+
+    def read_report(ticker, trade_date):
+        calls_to_store.append((ticker, trade_date))
+        return sk_report if ran["value"] and ticker == "SK" else ""
+
+    store = SimpleNamespace(load_watchlist=lambda: [], read_report=read_report)
+    from tools.registry import registry
+
+    adapter = YeomanA2AAdapter(PlatformConfig(enabled=True))
+    adapter._native_trading_store = lambda: store  # type: ignore[method-assign]
+    resolved = []
+    adapter._resolve_task = lambda task_id, state, reply: resolved.append((task_id, state, reply))  # type: ignore[method-assign]
+
+    def dispatch(name, args):
+        ran["value"] = True
+        assert name == "tradingagents_analyze"
+        assert "HXSCL" in args["tickers"]
+        assert "KS" in args["tickers"]
+        return json.dumps({"date": "2026-09-24", "results": [{"ticker": "SK", "date": "2026-09-24", "decision_summary": "short card"}]})
+
+    monkeypatch.setattr(registry, "dispatch", dispatch)
+    adapter._run_tradingagents(_pending(
+        question="Analyse SK Hynix (000660.KS / HXSCL).",
+        date="2026-09-24",
+    ))
+
+    assert resolved == [("task-trading-test", protocol.STATE_COMPLETED, sk_report)]
+    assert calls_to_store[-1] == ("SK", "2026-09-24")
+
+
 def test_invalid_length_is_rejected_before_execution(monkeypatch):
     adapter = YeomanA2AAdapter(PlatformConfig(enabled=True))
     adapter._native_trading_store = lambda: _store(FULL_REPORT, [])  # type: ignore[method-assign]

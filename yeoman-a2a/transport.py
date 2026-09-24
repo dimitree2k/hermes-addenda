@@ -798,15 +798,19 @@ class YeomanA2AAdapter(BasePlatformAdapter):
                     if isinstance(payload.get("results"), list):
                         raw_results = payload["results"]
                     payload_date = self._markdown_text(payload.get("date")) or requested_date
+                    cached_tickers = [ticker for ticker in tickers if ticker in reports]
+                    result_tickers = []
                     for item in raw_results:
                         if not isinstance(item, dict):
                             continue
                         ticker = str(item.get("ticker") or "").strip().upper()
                         if not ticker:
                             continue
-                        if ticker not in tickers:
-                            tickers.append(ticker)
+                        if ticker not in result_tickers:
+                            result_tickers.append(ticker)
                         dates[ticker] = self._markdown_text(item.get("date")) or payload_date
+                    if result_tickers:
+                        tickers = list(dict.fromkeys([*cached_tickers, *result_tickers]))
                     reports.update(self._read_trading_reports(store_module, tickers, dates))
                     # A full report in a direct native response is acceptable
                     # only when no plugin store is available; a loaded store is
