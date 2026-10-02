@@ -28,6 +28,24 @@ Upstream's own policy, from `plugins/AGENTS.md`:
 |---|---|---|---|
 | [`yeoman-a2a/`](yeoman-a2a/) | `yeoman` | Hermes side of the strict Hermes/Yeoman A2A profile (`urn:hermes-yeoman:a2a-profile:v1`) | Not proposed — bilateral integration |
 
+## Skills
+
+Agent skills (plain `SKILL.md`, no code) for the `research` profile live in
+[`skills/research/`](skills/research/):
+
+| Skill | Trigger | Sources |
+|---|---|---|
+| [`sec-filings`](skills/research/sec-filings/) | Read, diff, or watch SEC EDGAR filings | EDGAR submissions, XBRL, full-text search (official, free) |
+| [`thesis-journal`](skills/research/thesis-journal/) | Record/check/review a position thesis; digest TradingAgents reports so they aren't re-read or re-run | Local files only (`~/Documents/research-journal/`) |
+| [`market-brief`](skills/research/market-brief/) | Scheduled pre-market / earnings-week / macro brief | federalreserve.gov, bls.gov, EDGAR, web search; no price feed |
+
+They complement the profile's `deep-research`, `grounded-citations` and `trading-analysis`
+skills and never call `tradingagents_analyze` themselves. Install by symlinking each directory
+into `~/.hermes/profiles/research/skills/research/`. `sec-filings` needs `SEC_USER_AGENT`
+(a contact string the SEC requires) in the research profile's `.env`.
+
+## Patches
+
 Two host-local patches with no upstream home are kept in [`patches/`](patches/) — one for the
 third-party `tradingagents` plugin, one for the bundled Langfuse plugin. They are not plugins and
 are not installable; they exist so a `git pull` or `hermes plugins update` cannot silently drop
