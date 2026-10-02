@@ -2,3 +2,4 @@
 - 2026-10-02: addenda housekeeping
 - 2026-10-02: minor update
 - 2026-10-02: yolo
+- 2026-10-02: addenda note
